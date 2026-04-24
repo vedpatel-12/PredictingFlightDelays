@@ -2,7 +2,7 @@ import pandas as pd
 
 df = pd.read_csv('airline_delay.csv', na_values = 'NA')
 
-#drop security delay columns (not relevant to our analysis)
+# Drop security delay columns (not relevant to our analysis)
 df = df.drop(columns=['security_ct', 'security_delay'])
 
 # Remove rows where all values are NaN
@@ -24,5 +24,5 @@ df = df.merge(airline_avg_delay, on='carrier', how='left')
 airport_avg_delay = df.groupby('airport')['delay_rate'].mean().rename('avg_airport_delay_rate')
 df = df.merge(airport_avg_delay, on='airport', how='left')
 
-#Save Dataset
+# Save Dataset
 df.to_csv('airline_delay_cleaned.csv', index=False)
