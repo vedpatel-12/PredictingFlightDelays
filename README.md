@@ -18,18 +18,25 @@ The key insight is that **many common causes of delays are predictable ahead of 
 
 ## How to Run (Step by Step)
 
-### 0. Install dependencies
+### 0. Get the raw dataset
+
+Download `flights_sample_3m.csv` from Kaggle:
+**[Flight Delay and Cancellation Dataset (2019–2023)](https://www.kaggle.com/datasets/patrickzel/flight-delay-and-cancellation-dataset-2019-2023)**
+
+Place the downloaded CSV in the same folder as the Python scripts.
+
+### 1. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 1. Clean the raw data
+### 3. Clean the raw data
 ```bash
 python3 clean_data.py
 ```
 Reads `flights_sample_3m.csv`, creates the target column, removes leaky columns, extracts date/time features, and saves `cleaned_flights.csv`.
 
-### 2. Fetch weather data
+### 4. Fetch weather data
 ```bash
 python3 fetch_weather.py
 ```
@@ -37,13 +44,13 @@ Calls the Open-Meteo Archive API for every unique origin airport in the dataset.
 
 > **Note:** The dataset covers ~200+ airports across 2019–2023. The full fetch takes roughly 5–10 minutes on first run, then is instant on subsequent runs.
 
-### 3. Merge weather into flights
+### 5. Merge weather into flights
 ```bash
 python3 merge_weather.py
 ```
 Joins `cleaned_flights.csv` with `weather_cache.csv` on `ORIGIN + FL_DATE` and saves `flights_with_weather.csv`.
 
-### 4. Run the models
+### 6. Run the models
 ```bash
 python3 model_logistic_regression.py
 python3 model_random_forest.py
