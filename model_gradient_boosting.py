@@ -1,99 +1,171 @@
-"""
-Gradient Boosting Model for Predicting Flight Delay Rate
----------------------------------------------------------
-Gradient Boosting builds trees sequentially. Each new tree is trained to
-correct the residual errors (mistakes) of all previous trees combined. The
-model "boosts" performance step by step, nudging predictions in the direction
-that reduces loss the most (the gradient of the loss function).
-
-Unlike Random Forest (parallel trees, averaged), Gradient Boosting is additive:
-  final prediction = tree_1 + tree_2 + ... + tree_N  (scaled by learning_rate)
-
-Strengths: typically the highest accuracy on tabular data, handles mixed
-feature types well, expressive without needing deep trees.
-Weakness: more hyperparameters to tune, slower to train than Random Forest
-if not carefully configured.
-"""
-
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ── Load data ──────────────────────────────────────────────────────────────────
-df = pd.read_csv("airline_delay_cleaned.csv")
+from sklearn.ensemble        import HistGradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing   import OrdinalEncoder
+from sklearn.metrics         import (accuracy_score, precision_score,
+                                     recall_score, f1_score, roc_auc_score,
+                                     confusion_matrix, classification_report)
+from sklearn.inspection      import permutation_importance
 
-# ── Feature selection (non-leaky columns only) ─────────────────────────────────
-features = ["month", "carrier", "airport", "arr_flights",
-            "avg_airline_delay_rate", "avg_airport_delay_rate"]
-target = "delay_rate"
+# Settings
+INPUT_CSV    = "flights_with_weather.csv"
+SAMPLE_SIZE  = None  # HistGradientBoosting handles 3M rows efficiently
+RANDOM_STATE = 42
 
-X = pd.get_dummies(df[features], columns=["carrier", "airport"])
-y = df[target]
+print(f"Loading {INPUT_CSV}...")
+df = pd.read_csv(INPUT_CSV, low_memory=False)
+print(f"  Full dataset shape: {df.shape}")
 
-# ── Train / test split ─────────────────────────────────────────────────────────
+if SAMPLE_SIZE and len(df) > SAMPLE_SIZE:
+    df = df.sample(n=SAMPLE_SIZE, random_state=RANDOM_STATE)
+    print(f"  Using random sample of {SAMPLE_SIZE:,} rows.")
+
+# Non-leaky features only — all knowable before the flight departs
+CATEGORICAL_FEATURES = ["AIRLINE_CODE", "ORIGIN", "DEST"]
+NUMERIC_FEATURES = [
+    "YEAR", "MONTH", "DAY", "DAY_OF_WEEK", "IS_WEEKEND",
+    "SCHEDULED_DEP_HOUR", "DEP_TIME_BLOCK",
+    "CRS_ELAPSED_TIME", "DISTANCE",
+    "temperature_2m_max", "temperature_2m_min",
+    "precipitation_sum", "wind_speed_10m_max",
+]
+TARGET = "DELAYED"
+
+all_needed = CATEGORICAL_FEATURES + NUMERIC_FEATURES + [TARGET]
+df = df[[c for c in all_needed if c in df.columns]].copy()
+df = df.dropna(subset=[TARGET])
+
+# OrdinalEncoder is required by HistGradientBoostingClassifier
+# unknown_value=-1 handles any new categories seen at test time
+enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+cat_cols_in_df = [c for c in CATEGORICAL_FEATURES if c in df.columns]
+df[cat_cols_in_df] = enc.fit_transform(df[cat_cols_in_df].astype(str))
+
+numeric_df = df.select_dtypes(include="number")
+df[numeric_df.columns] = numeric_df.fillna(numeric_df.median())
+
+feature_cols = [c for c in CATEGORICAL_FEATURES + NUMERIC_FEATURES if c in df.columns]
+X = df[feature_cols]
+y = df[TARGET].astype(int)
+
+print(f"\nFeatures used ({len(feature_cols)}): {feature_cols}")
+print(f"Class balance — Not delayed: {(y==0).sum():,}  Delayed: {(y==1).sum():,}")
+
+# 80/20 train/test split
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+    X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
 )
+print(f"\nTrain: {len(X_train):,} rows | Test: {len(X_test):,} rows")
 
-# ── Model: Gradient Boosting Regressor ────────────────────────────────────────
-# n_estimators: how many sequential trees to build.
-# learning_rate: how much each tree's correction is scaled before being added.
-#   Lower rate + more trees = smoother, more accurate, but slower.
-# max_depth: depth of each individual tree. Shallow trees (3-5) are typical
-#   because GB corrects errors across many trees, not within one deep tree.
-# subsample: fraction of training data sampled for each tree (< 1.0 adds
-#   randomness, which reduces overfitting — this is "Stochastic GB").
-model = GradientBoostingRegressor(
-    n_estimators=300,
+print("\nTraining HistGradientBoostingClassifier...")
+print("  (Early stopping enabled — will stop when validation score stops improving)")
+model = HistGradientBoostingClassifier(
+    max_iter=500,
     learning_rate=0.05,
-    max_depth=4,
-    subsample=0.8,
-    min_samples_leaf=5,
-    random_state=42
+    max_depth=6,
+    min_samples_leaf=20,
+    early_stopping=True,
+    validation_fraction=0.1,
+    n_iter_no_change=20,
+    class_weight="balanced",  # prevents the model from ignoring delayed flights
+    random_state=RANDOM_STATE,
+    verbose=1,
 )
 model.fit(X_train, y_train)
+print(f"\nTraining stopped at {model.n_iter_} trees (out of max {model.max_iter}).")
 
-# ── Evaluation on held-out test set ───────────────────────────────────────────
-y_pred = model.predict(X_test)
+y_pred      = model.predict(X_test)
+y_pred_prob = model.predict_proba(X_test)[:, 1]
 
-mae  = mean_absolute_error(y_test, y_pred)
-rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-r2   = r2_score(y_test, y_pred)
+acc       = accuracy_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred, zero_division=0)
+recall    = recall_score(y_test, y_pred, zero_division=0)
+f1        = f1_score(y_test, y_pred, zero_division=0)
+roc_auc   = roc_auc_score(y_test, y_pred_prob)
 
-print("=== Gradient Boosting Regressor ===")
-print(f"MAE  : {mae:.4f}  — average absolute error in delay_rate")
-print(f"RMSE : {rmse:.4f}  — penalises large errors more than MAE")
-print(f"R²   : {r2:.4f}  — fraction of variance explained (1.0 = perfect)")
+print("\n=== Gradient Boosting Results ===")
+print(f"Accuracy  : {acc:.4f}")
+print(f"Precision : {precision:.4f}")
+print(f"Recall    : {recall:.4f}")
+print(f"F1 Score  : {f1:.4f}")
+print(f"ROC-AUC   : {roc_auc:.4f}")
 
-# ── Cross-validation ───────────────────────────────────────────────────────────
-# 5-fold CV gives a more reliable estimate of generalisation performance than
-# a single train/test split, because every sample gets to be in the test fold.
-cv_r2 = cross_val_score(model, X, y, cv=5, scoring="r2")
-print(f"\n5-fold CV R²: {cv_r2.mean():.4f} ± {cv_r2.std():.4f}")
+print("\n--- Full Classification Report ---")
+print(classification_report(y_test, y_pred, target_names=["Not Delayed", "Delayed"]))
 
-# ── Feature importance ─────────────────────────────────────────────────────────
-# GB feature importance is the total reduction in loss attributable to each
-# feature across all splits and all trees.
+cm = confusion_matrix(y_test, y_pred)
+print("--- Confusion Matrix ---")
+print(f"               Predicted Not Delayed   Predicted Delayed")
+print(f"Actual Not Del : {cm[0,0]:>20,}   {cm[0,1]:>17,}")
+print(f"Actual Delayed : {cm[1,0]:>20,}   {cm[1,1]:>17,}")
+
+# HistGradientBoosting has no .feature_importances_, so we use permutation
+# importance instead — shuffles each feature and measures the ROC-AUC drop
+print("\nComputing permutation importance on a 20,000-row sample (may take ~30s)...")
+rng        = np.random.default_rng(RANDOM_STATE)
+sample_idx = rng.choice(len(X_test), size=min(20_000, len(X_test)), replace=False)
+X_sample   = X_test.iloc[sample_idx]
+y_sample   = y_test.iloc[sample_idx]
+
+perm = permutation_importance(
+    model, X_sample, y_sample,
+    n_repeats=5,
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+    scoring="roc_auc",
+)
+
 importance_df = pd.DataFrame({
-    "feature": X.columns,
-    "importance": model.feature_importances_
+    "feature":    feature_cols,
+    "importance": perm.importances_mean,
+    "std":        perm.importances_std,
 }).sort_values("importance", ascending=False)
 
-print("\nTop 10 most important features:")
-print(importance_df.head(10).to_string(index=False))
+print("\n--- Feature Importance (mean ROC-AUC drop per feature) ---")
+print(importance_df.to_string(index=False))
 
-# ── Training loss curve ────────────────────────────────────────────────────────
-# Shows how training error decreases as more trees are added. A flattening
-# curve means additional trees contribute little — useful for tuning n_estimators.
-plt.figure(figsize=(8, 4))
-plt.plot(model.train_score_, label="Training loss")
-plt.xlabel("Number of boosting stages (trees)")
-plt.ylabel("Loss (MSE)")
-plt.title("Gradient Boosting — Training Loss Curve")
-plt.legend()
+top15 = importance_df.head(15)
+fig, ax = plt.subplots(figsize=(9, 6))
+ax.barh(top15["feature"][::-1], top15["importance"][::-1],
+        xerr=top15["std"][::-1], color="darkorange", ecolor="gray", capsize=3)
+ax.set_xlabel("Mean ROC-AUC drop (higher = more important)")
+ax.set_title("Gradient Boosting — Permutation Feature Importance")
 plt.tight_layout()
-plt.savefig("gb_training_loss.png", dpi=120)
-print("\nTraining loss curve saved to gb_training_loss.png")
+plt.savefig("gb_feature_importance.png", dpi=120)
+print("\nFeature importance chart saved to gb_feature_importance.png")
+
+# Learning curve — shows how the score improved as more trees were added
+train_scores = getattr(model, "train_score_", None)
+val_scores   = getattr(model, "validation_score_", None)
+if train_scores is not None:
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(train_scores, label="Train score")
+    if val_scores is not None:
+        ax.plot(val_scores, label="Validation score")
+    ax.set_xlabel("Number of trees")
+    ax.set_ylabel("Score")
+    ax.set_title("Gradient Boosting — Learning Curve")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("gb_learning_curve.png", dpi=120)
+    print("Learning curve saved to gb_learning_curve.png")
+
+fig, ax = plt.subplots(figsize=(5, 4))
+im = ax.imshow(cm, cmap="Oranges")
+ax.set_xticks([0, 1]); ax.set_xticklabels(["Not Delayed", "Delayed"])
+ax.set_yticks([0, 1]); ax.set_yticklabels(["Not Delayed", "Delayed"])
+ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
+ax.set_title("Gradient Boosting — Confusion Matrix")
+for i in range(2):
+    for j in range(2):
+        ax.text(j, i, f"{cm[i,j]:,}", ha="center", va="center",
+                color="white" if cm[i,j] > cm.max()/2 else "black")
+plt.colorbar(im, ax=ax)
+plt.tight_layout()
+plt.savefig("gb_confusion_matrix.png", dpi=120)
+print("Confusion matrix saved to gb_confusion_matrix.png")
